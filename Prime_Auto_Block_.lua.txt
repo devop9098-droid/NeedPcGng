@@ -1,0 +1,1257 @@
+local Env=(getgenv and getgenv())or _G
+pcall(function()
+if Env.AutoBlockUnload then
+Env.AutoBlockUnload()
+end
+end)
+local Fluent=loadstring(game:HttpGet("https://github.com/StyearX/Fluent-Modded/releases/download/1.6.0/main.lua"))()
+local Players=game:GetService("Players")
+local Workspace=game:GetService("Workspace")
+local RunService=game:GetService("RunService")
+local UserInputService=game:GetService("UserInputService")
+local LocalPlayer=Players.LocalPlayer
+local function detectDevice()
+if UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled then
+return "Mobile"
+end
+return "PC"
+end
+local Device=detectDevice()
+local isMobile=(Device=="Mobile")
+local CONFIG={
+Enabled=true,
+Range=13,
+FrontDashRange=30,
+SlideDashRange=17,
+SkillRange=30,
+AutoHitbox=true,
+HitboxMargin=3,
+ReleaseOffset=-0.200,
+MaxHold=2.0,
+SilentAim=false,
+Camlock=false,
+CamlockSpeed=30,
+M1AfterBlock=false,
+M1Range=8,
+Mode="Near",
+SelectKey="Y",
+SelectRadius=200,
+Debug=false,
+}
+local function dbg(...)
+if CONFIG.Debug then
+print("[AutoBlock]",...)
+end
+end
+local ATTACK_IDS={
+10469493270,10469630950,10469639222,10469643643,
+13532562418,13532600125,13532604085,13294471966,
+13296577783,13296577783,13295919399,13295936866,
+13370310513,13390230973,13378751717,13378708199,
+14004222985,13997092940,14001963401,14136436157,
+16515503507,16515520431,16515448089,16552234590,
+17889458563,17889461810,17889471098,17889290569,
+123005629431309,100059874351664,104895379416342,134775406437626,
+125361499827663,105701432344953,104293439261333,114460992057353,
+111644455066361,112778933066374,80488470577181,117726521294150,
+}
+local UPPERCUT_IDS={10503381238}
+local FRONT_DASH_IDS={13380255751,10479335397}
+local SLIDE_DASH_IDS={10480793962,10480796021}
+local SKILL_IDS={
+10468665991,10466974800,12296882427,12351854556,131820095363270,
+135289891173395,125955606488863,109617620932970,12534735382,12502664044,
+12509505723,12684390285,13376869471,13294790250,13376962659,14046756619,15290930205,15295336270,15295895753,
+16139108718,16515850153,16431491215,17857788598,18179181663,
+17799224866,
+}
+local M1_SKILL_IDS={
+[131820095363270]=true,
+[15295895753]=true,
+[12534735382]=true,
+[10466974800]=true,
+}
+local FIXED_HOLD={[16515850153]=3.1}
+local SKILL_MAX_HOLD=8
+local KIND={}
+for _,id in ipairs(ATTACK_IDS)do KIND[id]="Attack"end
+for _,id in ipairs(UPPERCUT_IDS)do KIND[id]="Uppercut"end
+for _,id in ipairs(FRONT_DASH_IDS)do KIND[id]="Front Dash"end
+for _,id in ipairs(SLIDE_DASH_IDS)do KIND[id]="Slide Dash"end
+for _,id in ipairs(SKILL_IDS)do KIND[id]=KIND[id]or "Skill"end
+local function parseId(str)
+local n=string.match(str,"%d+")
+return n and tonumber(n)or nil
+end
+local setPartListener
+local HITBOX_WINDOW=0.7
+local HITBOX_SCAN_RADIUS=90
+local HitboxReach={}
+local skillWatch={}
+local recentParts={}
+local function looksLikeHitbox(p)
+if not(p and p.Parent)then return false end
+local char=LocalPlayer.Character
+if char and p:IsDescendantOf(char)then return false end
+local ok,res=pcall(function()
+if p.Size.Magnitude<1 then return false end
+local named=string.find(string.lower(p.Name),"hitbox",1,true)~=nil
+if named then return true end
+local m=p:FindFirstAncestorOfClass("Model")
+if m and m:FindFirstChildOfClass("Humanoid")then return false end
+return(not p.CanCollide)and p.Transparency>=0.8 and p.Size.Magnitude<=250
+end)
+return ok and res
+end
+local function farEdge(part,rootPos)
+local off=part.Position-rootPos
+local d=off.Magnitude
+if d<0.01 then
+return math.max(part.Size.X,part.Size.Z)/2
+end
+local u=part.CFrame:VectorToObjectSpace(off.Unit)
+local s=part.Size
+return d+math.abs(u.X)*s.X/2+math.abs(u.Y)*s.Y/2+math.abs(u.Z)*s.Z/2
+end
+local function insideHitbox(part,pos,margin)
+local ok,res=pcall(function()
+local rel=part.CFrame:PointToObjectSpace(pos)
+local h=part.Size/2
+return math.abs(rel.X)<=h.X+margin and math.abs(rel.Y)<=h.Y+margin and math.abs(rel.Z)<=h.Z+margin
+end)
+return ok and res
+end
+local function skillReach(id)
+local learned=HitboxReach[id]
+if CONFIG.AutoHitbox and learned then
+return math.max(learned+CONFIG.HitboxMargin,CONFIG.SkillRange)
+end
+return CONFIG.SkillRange
+end
+local function rangeFor(kind,id)
+if kind=="Skill"then return skillReach(id)end
+if kind=="Front Dash"then return CONFIG.FrontDashRange end
+if kind=="Slide Dash"then return CONFIG.SlideDashRange end
+return CONFIG.Range
+end
+local function scanHitboxes(now)
+if next(skillWatch)==nil then
+if#recentParts>0 then recentParts={}end
+return
+end
+local i=1
+while i<=#recentParts do
+local rp=recentParts[i]
+if rp.ok==nil and now>rp.t then
+rp.ok=looksLikeHitbox(rp.part)
+end
+if rp.ok==false or(now-rp.t)>(HITBOX_WINDOW+0.3)or not rp.part.Parent then
+table.remove(recentParts,i)
+else
+i+=1
+end
+end
+for _,rp in ipairs(recentParts)do
+if rp.ok and not rp.done then
+local best,bestD
+for _,w in pairs(skillWatch)do
+if w.root.Parent and rp.t>=w.startedAt-0.25 and(rp.t-w.startedAt)<=HITBOX_WINDOW then
+local d=(rp.part.Position-w.root.Position).Magnitude
+if d<=HITBOX_SCAN_RADIUS and(not bestD or d<bestD)then
+best,bestD=w,d
+end
+end
+end
+if best then
+rp.done=true
+table.insert(best.parts,rp.part)
+local reach=math.clamp(farEdge(rp.part,best.root.Position),4,120)
+HitboxReach[best.id]=math.max(HitboxReach[best.id]or 0,reach)
+dbg("hitbox",best.id,rp.part.Name,"reach",math.floor(reach))
+end
+end
+end
+end
+local alive=true
+local connections={}
+local active={}
+local holding=false
+local m1Roots={}
+local currentTarget=nil
+local savedAutoRotate=nil
+local StatusPara=nil
+local lastStatus=nil
+local function setStatus(text)
+if text==lastStatus then return end
+lastStatus=text
+if StatusPara then
+pcall(function()StatusPara:SetDesc(text)end)
+end
+end
+local function getCommunicate()
+local char=LocalPlayer.Character
+return char and char:FindFirstChild("Communicate")
+end
+local function getMyRoot()
+local char=LocalPlayer.Character
+return char and char:FindFirstChild("HumanoidRootPart")
+end
+local function getMyHumanoid()
+local char=LocalPlayer.Character
+return char and char:FindFirstChildOfClass("Humanoid")
+end
+local trackedModels=setmetatable({},{__mode="k"})
+local selected=nil
+local selHighlight=nil
+local SelStatusPara=nil
+local DevicePara=nil
+local lastSelText=nil
+local lastSelTick=0
+local function getSelectedModel()
+if not selected then return nil end
+if selected.player then
+return selected.player.Character
+end
+return selected.model
+end
+local function isSelected(model)
+local m=getSelectedModel()
+return m~=nil and m==model
+end
+local TweenService=game:GetService("TweenService")
+local selGui,selTween=nil,nil
+local function destroyHighlight()
+if selTween then
+pcall(function()selTween:Cancel()end)
+selTween=nil
+end
+if selGui then
+pcall(function()selGui:Destroy()end)
+selGui=nil
+end
+end
+local function refreshHighlight()
+local m=getSelectedModel()
+if not(alive and CONFIG.Mode=="Select"and m and m.Parent)then
+destroyHighlight()
+return
+end
+local root=m:FindFirstChild("HumanoidRootPart")
+if not root then
+destroyHighlight()
+return
+end
+if selGui and selGui.Adornee==root then return end
+destroyHighlight()
+local ok,bb,tw=pcall(function()
+local gui=Instance.new("BillboardGui")
+gui.Name="AB_Select"
+gui.Adornee=root
+gui.AlwaysOnTop=true
+gui.LightInfluence=0
+gui.Size=UDim2.new(4.6,0,6.4,0)
+local fr=Instance.new("Frame")
+fr.Size=UDim2.fromScale(1,1)
+fr.BackgroundTransparency=1
+fr.BorderSizePixel=0
+fr.Parent=gui
+local corner=Instance.new("UICorner")
+corner.CornerRadius=UDim.new(0.12,0)
+corner.Parent=fr
+local stroke=Instance.new("UIStroke")
+stroke.Thickness=2.5
+stroke.Color=Color3.new(1,1,1)
+stroke.ApplyStrokeMode=Enum.ApplyStrokeMode.Border
+stroke.Parent=fr
+local grad=Instance.new("UIGradient")
+grad.Color=ColorSequence.new({
+ColorSequenceKeypoint.new(0,Color3.fromHex("#7850C8")),
+ColorSequenceKeypoint.new(0.35,Color3.fromHex("#6EE7FF")),
+ColorSequenceKeypoint.new(0.7,Color3.fromHex("#F472B6")),
+ColorSequenceKeypoint.new(1,Color3.fromHex("#7850C8")),
+})
+grad.Parent=stroke
+gui.Parent=(gethui and gethui())or game:GetService("CoreGui")
+local tween=TweenService:Create(grad,
+TweenInfo.new(2.2,Enum.EasingStyle.Linear,Enum.EasingDirection.In,-1),
+{Rotation=360})
+tween:Play()
+return gui,tween
+end)
+if ok then
+selGui,selTween=bb,tw
+end
+end
+local function updateSelStatus()
+local text
+if CONFIG.Mode~="Select"then
+text="Mode: Near (block anyone nearby)"
+else
+local m=getSelectedModel()
+if m then
+local plr=Players:GetPlayerFromCharacter(m)
+text="Target: "..(plr and plr.DisplayName or m.Name)
+else
+text="Target: none - select one"
+end
+end
+if text==lastSelText then return end
+lastSelText=text
+if SelStatusPara then
+pcall(function()SelStatusPara:SetDesc(text)end)
+end
+end
+local function setSelected(model)
+if model==nil then
+selected=nil
+else
+selected={model=model,player=Players:GetPlayerFromCharacter(model)}
+end
+refreshHighlight()
+updateSelStatus()
+end
+local function selTick(now)
+if now-lastSelTick<0.5 then return end
+lastSelTick=now
+if selected and not selected.player and not(selected.model and selected.model.Parent)then
+selected=nil
+end
+refreshHighlight()
+updateSelStatus()
+end
+local function modelFromPart(part)
+local m=part
+while m and m~=Workspace do
+if trackedModels[m]then return m end
+m=m.Parent
+end
+return nil
+end
+local rayParams=RaycastParams.new()
+rayParams.FilterType=Enum.RaycastFilterType.Exclude
+local function pickByRay(x,y,useInset)
+local cam=Workspace.CurrentCamera
+if not cam then return nil end
+local ray=useInset and cam:ScreenPointToRay(x,y)or cam:ViewportPointToRay(x,y)
+local myChar=LocalPlayer.Character
+local ignore={myChar}
+for _=1,10 do
+rayParams.FilterDescendantsInstances=ignore
+local res=Workspace:Raycast(ray.Origin,ray.Direction*1000,rayParams)
+if not res then return nil end
+local part=res.Instance
+local m=modelFromPart(part)
+if m and m~=myChar then
+if part.Parent==m and part.Name~="HumanoidRootPart"and part.Transparency<0.9 then
+return m
+end
+ignore[#ignore+1]=part
+elseif part.Transparency>=0.95 and not part.CanCollide then
+ignore[#ignore+1]=part
+else
+return nil
+end
+end
+return nil
+end
+local function pickNear(point)
+local cam=Workspace.CurrentCamera
+if not cam then return nil end
+local best,bestD
+for model in pairs(trackedModels)do
+if model.Parent and model~=LocalPlayer.Character then
+local root=model:FindFirstChild("HumanoidRootPart")
+if root then
+local v,onScreen=cam:WorldToViewportPoint(root.Position)
+if onScreen then
+local d=(Vector2.new(v.X,v.Y)-point).Magnitude
+if d<=CONFIG.SelectRadius and(not bestD or d<bestD)then
+best,bestD=model,d
+end
+end
+end
+end
+end
+return best
+end
+local function selectKeyName()
+local opt=Fluent.Options and Fluent.Options.AB_SelectKey
+local v=opt and opt.Value
+if type(v)=="string"and v~=""then return v end
+return CONFIG.SelectKey
+end
+local MOUSE_ALIAS={MouseLeft="MouseButton1",MouseRight="MouseButton2",MouseMiddle="MouseButton3"}
+local function keyMatches(input)
+local name=selectKeyName()
+if input.UserInputType==Enum.UserInputType.Keyboard then
+return input.KeyCode.Name==name
+end
+return input.UserInputType.Name==name or input.UserInputType.Name==MOUSE_ALIAS[name]
+end
+table.insert(connections,UserInputService.TouchTap:Connect(function(positions,processed)
+if processed or not alive or CONFIG.Mode~="Select"then return end
+local pos=positions and positions[1]
+if not pos then return end
+local m=pickByRay(pos.X,pos.Y,true)
+if not m then return end
+if m==getSelectedModel()then
+setSelected(nil)
+else
+setSelected(m)
+end
+end))
+table.insert(connections,UserInputService.InputBegan:Connect(function(input,processed)
+if processed or not alive or CONFIG.Mode~="Select"then return end
+if not keyMatches(input)then return end
+local cam=Workspace.CurrentCamera
+if not cam then return end
+local center=cam.ViewportSize/2
+local m=pickByRay(center.X,center.Y,false)or pickNear(center)
+if not m then return end
+if m==getSelectedModel()then
+setSelected(nil)
+else
+setSelected(m)
+end
+end))
+local function lockRotation(on)
+local hum=getMyHumanoid()
+if not hum then return end
+if on then
+if savedAutoRotate==nil then
+savedAutoRotate=hum.AutoRotate
+end
+hum.AutoRotate=false
+elseif savedAutoRotate~=nil then
+hum.AutoRotate=savedAutoRotate
+savedAutoRotate=nil
+end
+end
+local function faceTarget(root)
+local myRoot=getMyRoot()
+if not(myRoot and root and root.Parent)then return end
+local p=myRoot.Position
+local t=root.Position
+local flat=Vector3.new(t.X-p.X,0,t.Z-p.Z)
+if flat.Magnitude<0.05 then return end
+myRoot.CFrame=CFrame.lookAt(p,p+flat)
+end
+local function pickTarget()
+local myRoot=getMyRoot()
+if not myRoot then return nil end
+local best,bestDist=nil,nil
+for _,info in pairs(active)do
+local root=info.root
+if root and root.Parent then
+local d=(root.Position-myRoot.Position).Magnitude
+if not bestDist or d<bestDist then
+best,bestDist=info,d
+end
+end
+end
+return best
+end
+local function applyAim()
+if not holding then return end
+if CONFIG.SilentAim and currentTarget then
+lockRotation(true)
+faceTarget(currentTarget.root)
+else
+lockRotation(false)
+end
+end
+local CAM_BIND="AutoBlockCamlock"
+local PITCH_FOLLOW_LOCKED=0.01
+local CAM_MAX_PITCH=math.rad(85)
+local camState=nil
+local function stopCamlock()
+if camState then
+local cam=Workspace.CurrentCamera
+if cam then
+cam.CameraType=camState.origType
+end
+camState=nil
+end
+end
+pcall(function()RunService:UnbindFromRenderStep(CAM_BIND)end)
+RunService:BindToRenderStep(CAM_BIND,Enum.RenderPriority.Camera.Value+1,function(dt)
+if not(holding and CONFIG.Camlock)then
+if camState then stopCamlock()end
+return
+end
+local cam=Workspace.CurrentCamera
+local myRoot=getMyRoot()
+local root=currentTarget and currentTarget.root
+if not(alive and holding and CONFIG.Camlock and cam and myRoot and root and root.Parent)then
+stopCamlock()
+return
+end
+if not camState then
+local pitch0,yaw0=cam.CFrame:ToOrientation()
+camState={
+origType=cam.CameraType,
+rootInCam=cam.CFrame:PointToObjectSpace(myRoot.Position),
+lockPitch=pitch0,
+curPitch=pitch0,
+curYaw=yaw0,
+lastRot=cam.CFrame.Rotation,
+}
+cam.CameraType=Enum.CameraType.Scriptable
+end
+local st=camState
+local k=1-math.exp(-CONFIG.CamlockSpeed*dt)
+local dir=root.Position-myRoot.Position
+if Vector3.new(dir.X,0,dir.Z).Magnitude>0.05 then
+local targetYaw=math.atan2(-dir.X,-dir.Z)
+local diff=(targetYaw-st.curYaw+math.pi)%(math.pi*2)-math.pi
+st.curYaw=st.curYaw+diff*k
+end
+if PITCH_FOLLOW_LOCKED>0 then
+local camPos=myRoot.Position-st.lastRot*st.rootInCam
+local d3=root.Position-camPos
+local horiz=math.sqrt(d3.X*d3.X+d3.Z*d3.Z)
+local aim=math.clamp(math.atan2(d3.Y,math.max(horiz,0.01)),-CAM_MAX_PITCH,CAM_MAX_PITCH)
+st.curPitch=st.curPitch+(st.lockPitch+(aim-st.lockPitch)*PITCH_FOLLOW_LOCKED-st.curPitch)*k
+end
+local rot=CFrame.fromOrientation(st.curPitch,st.curYaw,0)
+st.lastRot=rot
+cam.CFrame=CFrame.new(myRoot.Position-rot*st.rootInCam)*rot
+end)
+local function pressF()
+if holding then return true end
+local remote=getCommunicate()
+if not remote then
+dbg("khong tim thay Character.Communicate")
+return false
+end
+holding=true
+local cam=Workspace.CurrentCamera
+remote:FireServer({
+MousePos=cam and cam.CFrame or CFrame.new(),
+Key=Enum.KeyCode.F,
+Goal="KeyPress",
+Tick=1,
+})
+dbg("PRESS F")
+return true
+end
+local M1_RELEASE_DELAY=0.03
+local function fireM1(remote)
+local cam=Workspace.CurrentCamera
+local okPress=pcall(function()
+remote:FireServer({
+MousePos=cam and cam.CFrame or CFrame.new(),
+Mobile=true,
+Goal="LeftClick",
+Tick=1,
+})
+end)
+if not okPress then return end
+task.delay(M1_RELEASE_DELAY,function()
+local r=getCommunicate()or remote
+pcall(function()
+r:FireServer({
+Mobile=true,
+Goal="LeftClickRelease",
+Tick=1,
+})
+end)
+end)
+dbg("M1 after block")
+end
+local function releaseF(skipM1)
+if not holding then return end
+holding=false
+lockRotation(false)
+local doM1=false
+if(not skipM1)and CONFIG.M1AfterBlock and alive then
+local myRoot=getMyRoot()
+if myRoot then
+for r in pairs(m1Roots)do
+if r.Parent and(r.Position-myRoot.Position).Magnitude<=CONFIG.M1Range then
+doM1=true
+break
+end
+end
+end
+end
+m1Roots={}
+local remote=getCommunicate()
+if remote then
+remote:FireServer({
+Goal="KeyRelease",
+Key=Enum.KeyCode.F,
+Tick=1,
+})
+if doM1 then
+fireM1(remote)
+end
+end
+dbg("RELEASE F")
+setStatus("Idle")
+end
+local function clearAll()
+active={}
+currentTarget=nil
+releaseF(true)
+end
+local function trackDone(info,now)
+local track=info.track
+local ok,playing,remaining=pcall(function()
+if not track.IsPlaying then
+return false,0
+end
+local len=track.Length
+if len<=0 then
+return true,math.huge
+end
+local speed=math.max(math.abs(track.Speed),0.01)
+return true,(len-track.TimePosition)/speed
+end)
+if not ok then return true end
+if playing then
+info.stoppedAt=nil
+return remaining<=-CONFIG.ReleaseOffset
+end
+info.stoppedAt=info.stoppedAt or now
+return(now-info.stoppedAt)>=math.max(CONFIG.ReleaseOffset,0)
+end
+table.insert(connections,RunService.Heartbeat:Connect(function()
+if not alive then return end
+if next(active)==nil then
+if holding then releaseF()end
+currentTarget=nil
+return
+end
+local now=os.clock()
+for track,info in pairs(active)do
+local done
+if info.fixedHold then
+done=(now-info.startedAt)>=info.fixedHold
+else
+done=(now-info.startedAt)>info.maxHold or trackDone(info,now)
+end
+if done then
+active[track]=nil
+end
+end
+if next(active)==nil then
+currentTarget=nil
+releaseF()
+return
+end
+currentTarget=pickTarget()
+applyAim()
+end))
+local function ownerInfo(model)
+local plr=Players:GetPlayerFromCharacter(model)
+if plr then
+return plr.Name,plr.DisplayName
+end
+return model.Name,model.Name
+end
+local function startBlock(model,root,track,kind,id,dist)
+if not pressF()then return end
+local allowM1
+if kind=="Skill"then
+allowM1=M1_SKILL_IDS[id]==true
+else
+allowM1=(kind~="Uppercut")
+end
+if allowM1 then
+m1Roots[root]=true
+end
+local name,display=ownerInfo(model)
+local fixed=(kind=="Skill")and FIXED_HOLD[id]or nil
+active[track]={
+track=track,
+root=root,
+model=model,
+kind=kind,
+id=id,
+startedAt=os.clock(),
+fixedHold=fixed,
+maxHold=(kind=="Skill")and SKILL_MAX_HOLD or CONFIG.MaxHold,
+}
+currentTarget=pickTarget()
+applyAim()
+dbg(name,kind,id,"-> BLOCK",math.floor(dist),fixed and("hold "..fixed.."s")or "")
+setStatus(string.format("Blocking  %s  |  %s  |  %d studs",display,kind,math.floor(dist)))
+end
+local PENDING_WINDOW=0.45
+local SKILL_PENDING_WINDOW=1.0
+local pending={}
+local function onTrack(model,track)
+if not(alive and CONFIG.Enabled)then return end
+if not(model and model.Parent)or model==LocalPlayer.Character then return end
+if CONFIG.Mode=="Select"and not isSelected(model)then return end
+local anim=track.Animation
+if not anim then return end
+local id=parseId(anim.AnimationId)
+if not id then return end
+local kind=KIND[id]
+if not kind then
+if CONFIG.Debug then dbg("anim khac:",id,model.Name)end
+return
+end
+local myRoot=getMyRoot()
+local root=model:FindFirstChild("HumanoidRootPart")
+if not(myRoot and root)then return end
+local watch
+if kind=="Skill"then
+watch={model=model,root=root,id=id,startedAt=os.clock(),parts={}}
+skillWatch[track]=watch
+setPartListener(true)
+end
+local range=rangeFor(kind,id)
+local dist=(myRoot.Position-root.Position).Magnitude
+if dist>range then
+dbg(model.Name,kind,id,"-> xa, doi",math.floor(dist),">",math.floor(range))
+pending[track]={model=model,kind=kind,id=id,startedAt=os.clock(),watch=watch}
+return
+end
+pending[track]=nil
+startBlock(model,root,track,kind,id,dist)
+end
+local hooked=setmetatable({},{__mode="k"})
+local seen=setmetatable({},{__mode="k"})
+local function readPos(t)return t.TimePosition end
+local function readPlaying(t)return t.IsPlaying end
+local function markAndHandle(model,track,fromPoll)
+local okp,pos=pcall(readPos,track)
+if not okp then pos=0 end
+local now=os.clock()
+local rec=seen[track]
+if fromPoll then
+if not rec then
+seen[track]={t=now,pos=pos}
+onTrack(model,track)
+else
+if pos+0.08<rec.pos then
+rec.t=now
+onTrack(model,track)
+end
+rec.pos=pos
+end
+else
+if rec and now-rec.t<0.1 then
+rec.pos=pos
+return
+end
+seen[track]={t=now,pos=pos}
+onTrack(model,track)
+end
+end
+local function hookAnimator(model,animator)
+if hooked[animator]then return end
+hooked[animator]=true
+animator.AnimationPlayed:Connect(function(track)
+markAndHandle(model,track,false)
+end)
+end
+local function hookModel(model)
+if trackedModels[model]then return end
+trackedModels[model]=true
+for _,d in ipairs(model:GetDescendants())do
+if d:IsA("Animator")then
+hookAnimator(model,d)
+end
+end
+model.DescendantAdded:Connect(function(d)
+if d:IsA("Animator")then
+hookAnimator(model,d)
+end
+end)
+end
+local function tryHook(obj)
+if obj.ClassName~="Model"then return end
+if obj==LocalPlayer.Character then return end
+task.spawn(function()
+local hum=obj:FindFirstChildOfClass("Humanoid")or obj:WaitForChild("Humanoid",5)
+if hum and obj.Parent and obj~=LocalPlayer.Character then
+hookModel(obj)
+end
+end)
+end
+local function watchLive(live)
+for _,obj in ipairs(live:GetChildren())do
+tryHook(obj)
+end
+table.insert(connections,live.ChildAdded:Connect(tryHook))
+end
+local live=Workspace:FindFirstChild("Live")
+if live then
+watchLive(live)
+end
+table.insert(connections,Workspace.ChildAdded:Connect(function(child)
+if child.Name=="Live"then
+watchLive(child)
+end
+end))
+local function watchPlayerFallback(player)
+if player==LocalPlayer then return end
+if player.Character then tryHook(player.Character)end
+table.insert(connections,player.CharacterAdded:Connect(tryHook))
+end
+for _,p in ipairs(Players:GetPlayers())do
+watchPlayerFallback(p)
+end
+table.insert(connections,Players.PlayerAdded:Connect(watchPlayerFallback))
+local animatorCache=setmetatable({},{__mode="k"})
+local rootCache=setmetatable({},{__mode="k"})
+local pollFrame=0
+local partConn=nil
+setPartListener=function(on)
+if on and not partConn then
+partConn=Workspace.DescendantAdded:Connect(function(d)
+if d:IsA("BasePart")then
+recentParts[#recentParts+1]={part=d,t=os.clock()}
+if#recentParts>60 then
+table.remove(recentParts,1)
+end
+end
+end)
+elseif(not on)and partConn then
+partConn:Disconnect()
+partConn=nil
+end
+end
+table.insert(connections,{Disconnect=function()setPartListener(false)end})
+table.insert(connections,RunService.Heartbeat:Connect(function()
+if not(alive and CONFIG.Enabled)then return end
+local now=os.clock()
+selTick(now)
+scanHitboxes(now)
+for track,w in pairs(skillWatch)do
+if not w.model.Parent or(now-w.startedAt)>(HITBOX_WINDOW+0.5)then
+skillWatch[track]=nil
+end
+end
+if next(skillWatch)==nil then setPartListener(false)end
+for track,p in pairs(pending)do
+local okq,playing=pcall(readPlaying,track)
+if not okq then playing=false end
+local window=(p.kind=="Skill")and SKILL_PENDING_WINDOW or PENDING_WINDOW
+if not playing or not p.model.Parent or(now-p.startedAt)>window then
+pending[track]=nil
+else
+local myRoot=getMyRoot()
+local root=p.model:FindFirstChild("HumanoidRootPart")
+if myRoot and root then
+local dist=(myRoot.Position-root.Position).Magnitude
+local hit=dist<=rangeFor(p.kind,p.id)
+if(not hit)and p.kind=="Skill"and CONFIG.AutoHitbox and p.watch then
+for _,part in ipairs(p.watch.parts)do
+if part.Parent and insideHitbox(part,myRoot.Position,CONFIG.HitboxMargin)then
+hit=true
+break
+end
+end
+end
+if hit then
+pending[track]=nil
+startBlock(p.model,root,track,p.kind,p.id,dist)
+end
+end
+end
+end
+pollFrame+=1
+local meRoot=getMyRoot()
+if meRoot then
+local myPos=meRoot.Position
+local myChar=LocalPlayer.Character
+local selMode=(CONFIG.Mode=="Select")
+for model in pairs(trackedModels)do
+if model.Parent and model~=myChar and(not selMode or isSelected(model))then
+local mRoot=rootCache[model]
+if not(mRoot and mRoot.Parent)then
+mRoot=model:FindFirstChild("HumanoidRootPart")
+rootCache[model]=mRoot
+end
+if mRoot then
+local d=(mRoot.Position-myPos).Magnitude
+if d<=150 and(d<=70 or pollFrame%4==0)then
+local animator=animatorCache[model]
+if not(animator and animator.Parent)then
+animator=model:FindFirstChildWhichIsA("Animator",true)
+animatorCache[model]=animator
+end
+if animator then
+local ok,tracks=pcall(animator.GetPlayingAnimationTracks,animator)
+if ok then
+for i=1,#tracks do
+markAndHandle(model,tracks[i],true)
+end
+end
+end
+end
+end
+end
+end
+end
+end))
+table.insert(connections,LocalPlayer.CharacterAdded:Connect(function()
+active={}
+pending={}
+currentTarget=nil
+holding=false
+m1Roots={}
+savedAutoRotate=nil
+setStatus("Idle")
+end))
+Fluent:AddTheme({
+Name="Dark Violet",
+Accent="#7850c8",
+AcrylicMain="#141414",
+AcrylicBorder="#0f0f0f",
+AcrylicGradient=ColorSequence.new(Color3.fromHex("#191919"),Color3.fromHex("#0a0a0a")),
+AcrylicNoise=0.9,
+TitleBarLine="#6433b4",
+Tab="#8256d2",
+Element="#6e46be",
+ElementBorder="#5a32aa",
+InElementBorder="#8c64dc",
+ElementTransparency=0.9,
+ElementBorderThickness=0.5,
+ToggleSlider="#6433b4",
+ToggleToggled="#966ee6",
+SliderRail="#502890",
+CheckboxUnchecked="#5a32aa",
+CheckboxChecked="#8c64dc",
+CheckboxCheck="#c8aaff",
+ProgressBarRail="#461e96",
+ProgressBarFill="#a078f0",
+DropdownFrame="#6433b4",
+DropdownHolder="#6e46be",
+DropdownBorder="#502890",
+DropdownOption="#7850c8",
+DropdownBorderThickness=0.5,
+Keybind="#8256d2",
+Input="#6433b4",
+InputFocused="#966ee6",
+InputIndicator="#aa82fa",
+Dialog="#6e46be",
+DialogHolder="#8256d2",
+DialogHolderLine="#5a32aa",
+DialogButton="#8c64dc",
+DialogButtonBorder="#502890",
+DialogBorder="#7850c8",
+DialogInput="#6433b4",
+DialogInputLine="#966ee6",
+Text="#dcc8ff",
+SubText="#b4a0dc",
+Hover="#a078f0",
+HoverChange=0.5,
+Background="https://raw.githubusercontent.com/StyearX/Assets/main/backgrounds.png",
+BackgroundTransparency=0.22,
+ViewportBackground=Color3.fromHex("#281450"),
+ViewportBackgroundImages=false,
+DropdownOutsideWindowBackground=Color3.fromHex("#1e0f3c"),
+DropdownOutsideWindowBackgroundImages=false,
+ShineEnabled=false,
+Shine={
+Speed=3.5,
+RotationSpeed=1.3,
+ColorSequence=ColorSequence.new({
+ColorSequenceKeypoint.new(0,Color3.fromHex("#0d1b2a")),
+ColorSequenceKeypoint.new(0.5,Color3.fromHex("#0077be")),
+ColorSequenceKeypoint.new(1,Color3.fromHex("#0d1b2a")),
+}),
+},
+StrokeShine=false,
+StrokeDark=Color3.fromHex("#3c1e78"),
+ButtonGradient={
+Background=ColorSequence.new({
+ColorSequenceKeypoint.new(0,Color3.fromHex("#191919")),
+ColorSequenceKeypoint.new(1,Color3.fromHex("#503296")),
+}),
+Stroke=ColorSequence.new({
+ColorSequenceKeypoint.new(0,Color3.fromHex("#0f0f0f")),
+ColorSequenceKeypoint.new(0.5,Color3.fromHex("#3c1e78")),
+ColorSequenceKeypoint.new(1,Color3.fromHex("#0f0f0f")),
+}),
+},
+DiscordJoinButton="#7850c8",
+WarningNotifyColor="#b478ff",
+SuccessNotifyColor="#a0c8ff",
+ErrorNotifyColor="#c864c8",
+InfoNotifyColor="#8c64dc",
+})
+local Window=Fluent:CreateWindow({
+Title="Auto Block",
+SubTitle="F Block | Skill Hitbox | Aim",
+TabWidth=isMobile and 120 or 150,
+Size=isMobile and UDim2.fromOffset(500,420)or UDim2.fromOffset(580,460),
+Acrylic=false,
+Background=false,
+Theme="Dark Violet",
+MinimizeKey="RightControl",
+Font="Arcade",
+Search={Search=true,Highlight=true},
+FolderName="AutoBlock",
+ScreenGuiName="AutoBlockUI",
+})
+local Minimizer=Fluent:CreateMinimizer({
+Icon="rbxassetid://133349480012001",
+Size=UDim2.fromOffset(50,50),
+Position=UDim2.new(0.1,0,0.12,0),
+Corner=12,
+Draggable=true,
+})
+Minimizer.Visible=true
+local Tabs={
+Main=Window:AddTab({Title="Auto Block",Icon="swords"}),
+Mode=Window:AddTab({Title="Mode",Icon="crosshair"}),
+Skill=Window:AddTab({Title="Skill Hitbox",Icon="zap"}),
+Aim=Window:AddTab({Title="Aim",Icon="lock"}),
+Config=Window:AddTab({Title="Config",Icon="save"}),
+Settings=Window:AddTabsInHeader({Title=" Settings",Icon="settings"}),
+}
+local inputIds={}
+local syncing=false
+local function addSlider(sec,key,title,desc,min,max,rounding,onChange)
+rounding=rounding or 2
+local sliderId="AB_"..key
+local inputId=sliderId.."_Input"
+local fmt="%."..rounding.."f"
+table.insert(inputIds,inputId)
+sec:AddSlider(sliderId,{
+Title=title,Description=desc,
+Min=min,Max=max,Default=CONFIG[key],Rounding=rounding,
+Callback=function(v)
+CONFIG[key]=v
+if onChange then onChange(v)end
+local input=Fluent.Options[inputId]
+if input and not syncing then
+syncing=true
+pcall(function()input:SetValue(string.format(fmt,v))end)
+syncing=false
+end
+end,
+})
+sec:AddInput(inputId,{
+Title=title.."",
+Default=string.format(fmt,CONFIG[key]),
+Placeholder=min.." - "..max,
+Numeric=false,
+Finished=true,
+Callback=function(text)
+if syncing then return end
+local n=tonumber(text)
+syncing=true
+if n then
+n=math.clamp(n,min,max)
+CONFIG[key]=n
+if onChange then onChange(n)end
+pcall(function()Fluent.Options[sliderId]:SetValue(n)end)
+end
+pcall(function()Fluent.Options[inputId]:SetValue(string.format(fmt,CONFIG[key]))end)
+syncing=false
+end,
+})
+end
+local secMain=Tabs.Main:AddSection("Auto Block","solar/target-bold")
+secMain:AddToggle("AB_Enabled",{
+Title="Enable",
+Description="Hold F when a nearby player starts an attack",
+Default=CONFIG.Enabled,
+Callback=function(v)
+CONFIG.Enabled=v
+if not v then clearAll()end
+end,
+})
+local secRange=Tabs.Main:AddSection("Range","solar/target-bold")
+addSlider(secRange,"Range","Attack Range","M1-M4 and Uppercut (studs)",5,60,0)
+addSlider(secRange,"FrontDashRange","Front Dash Range","studs",5,80,0)
+addSlider(secRange,"SlideDashRange","Slide Dash Range","studs",5,60,0)
+local secTime=Tabs.Main:AddSection("Timing","solar/clock-circle-bold")
+addSlider(secTime,"ReleaseOffset","Release Offset (s)","Negative = release earlier, positive = hold longer",-0.2,0.15,3)
+local secM1=Tabs.Main:AddSection("M1 After Block","solar/cursor-bold")
+secM1:AddToggle("AB_M1AfterBlock",{
+Title="M1 After Block",
+Description="Each F release: one M1. Skills excluded (except 4 IDs, see Skill Hitbox tab)",
+Default=CONFIG.M1AfterBlock,
+Callback=function(v)CONFIG.M1AfterBlock=v end,
+})
+addSlider(secM1,"M1Range","M1 Range","Only M1 if the attacker is within this distance at release",2,20,0)
+local secDbg=Tabs.Main:AddSection("Debug","solar/settings-bold")
+secDbg:AddToggle("AB_Debug",{
+Title="Debug Log",
+Description="Print detected animations / hitboxes to the console (F9)",
+Default=CONFIG.Debug,
+Callback=function(v)CONFIG.Debug=v end,
+})
+local secStatus=Tabs.Main:AddSection("Status","solar/widget-bold")
+StatusPara=secStatus:AddParagraph({Title="State",Content="Idle"})
+local secMode=Tabs.Mode:AddSection("Mode","solar/target-bold")
+secMode:AddDropdown("AB_Mode",{
+Title="Mode",
+Description="Near = block anyone nearby | Select = only block the selected target",
+Values={"Near","Select"},
+Default=CONFIG.Mode,
+Callback=function(v)
+CONFIG.Mode=v
+if v~="Select"then
+destroyHighlight()
+else
+refreshHighlight()
+end
+updateSelStatus()
+end,
+})
+local secSel=Tabs.Mode:AddSection("Select Target","solar/target-bold")
+DevicePara=secSel:AddParagraph({
+Title="Device: "..Device,
+Content=(Device=="Mobile")
+and "Tap directly on the target's body to select. Tap it again to unselect. Selecting another target replaces the old one."
+or "Press the Select Key while the target is at screen center. Press again to unselect. Selecting another target replaces the old one.",
+})
+local okKb=pcall(function()
+secSel:AddKeybind("AB_SelectKey",{
+Title="Select Key (PC)",
+Description="Key that selects the target at screen center",
+Mode="Toggle",
+Default=CONFIG.SelectKey,
+Callback=function()end,
+ChangedCallback=function(new)
+CONFIG.SelectKey=(typeof(new)=="EnumItem")and new.Name or tostring(new)
+end,
+})
+end)
+if not okKb then
+secSel:AddInput("AB_SelectKey_Input",{
+Title="Select Key (PC)",
+Default=CONFIG.SelectKey,
+Placeholder="e.g. Y",
+Numeric=false,
+Finished=true,
+Callback=function(text)
+local t=tostring(text):gsub("%s","")
+if t~=""then CONFIG.SelectKey=t end
+end,
+})
+end
+addSlider(secSel,"SelectRadius","Select Radius (px)","PC: how close to screen center the target must be (mobile needs a direct tap on the body)",50,500,0)
+secSel:AddButton({
+Title="Clear Target",
+Description="Unselect the current target",
+Icon="solar/restart-bold",
+Callback=function()setSelected(nil)end,
+})
+SelStatusPara=secSel:AddParagraph({Title="Selected",Content="Mode: Near (block anyone nearby)"})
+table.insert(connections,UserInputService.LastInputTypeChanged:Connect(function(t)
+local d
+if t==Enum.UserInputType.Touch then
+d="Mobile"
+elseif t==Enum.UserInputType.Keyboard or t==Enum.UserInputType.MouseButton1 or t==Enum.UserInputType.MouseMovement then
+d="PC"
+end
+if d and d~=Device then
+Device=d
+if DevicePara then
+pcall(function()DevicePara:SetTitle("Device: "..d)end)
+pcall(function()
+DevicePara:SetDesc((d=="Mobile")
+and "Tap directly on the target's body to select. Tap it again to unselect. Selecting another target replaces the old one."
+or "Press the Select Key while the target is at screen center. Press again to unselect. Selecting another target replaces the old one.")
+end)
+end
+end
+end))
+local secHb=Tabs.Skill:AddSection("Auto Hitbox Scan","solar/target-bold")
+secHb:AddToggle("AB_AutoHitbox",{
+Title="Auto Hitbox Scan",
+Description="Scan each skill's hitbox and learn its reach instead of a fixed distance",
+Default=CONFIG.AutoHitbox,
+Callback=function(v)CONFIG.AutoHitbox=v end,
+})
+addSlider(secHb,"HitboxMargin","Hitbox Margin","Extra studs around the scanned hitbox",0,15,1)
+addSlider(secHb,"SkillRange","Fallback Range","Used until a skill's hitbox has been scanned (studs)",5,100,0)
+secHb:AddButton({
+Title="Reset Learned Hitboxes",
+Description="Forget all scanned skill reaches",
+Icon="solar/restart-bold",
+Callback=function()
+HitboxReach={}
+Fluent:Notify({Title="Skill Hitbox",Content="Learned hitboxes cleared",Duration=3})
+end,
+})
+local secSkillInfo=Tabs.Skill:AddSection("Rules","solar/clock-circle-bold")
+secSkillInfo:AddParagraph({Title="ID 16515850153",Content="Hold F for 3.1s then release"})
+secSkillInfo:AddParagraph({Title="M1 After Block skills",Content="131820095363270, 15295895753, 12534735382, 10466974800 (other skills: no M1)"})
+local secAim=Tabs.Aim:AddSection("Aim While Blocking","solar/target-bold")
+secAim:AddToggle("AB_SilentAim",{
+Title="Silent Aim",
+Description="AutoRotate off and turn your body toward the attacker while blocking",
+Default=CONFIG.SilentAim,
+Callback=function(v)
+CONFIG.SilentAim=v
+if not v then lockRotation(false)end
+end,
+})
+secAim:AddToggle("AB_Camlock",{
+Title="Camlock",
+Description="Prime relative camlock: smooth, camera orbits around you while blocking",
+Default=CONFIG.Camlock,
+Callback=function(v)CONFIG.Camlock=v end,
+})
+addSlider(secAim,"CamlockSpeed","Camlock Speed","Higher = camera follows the attacker faster",2,100000,0)
+secAim:AddParagraph({Title="Pitch",Content="0.01 (locked)"})
+local function unload()
+alive=false
+CONFIG.Enabled=false
+pcall(clearAll)
+for _,c in ipairs(connections)do
+pcall(function()c:Disconnect()end)
+end
+pcall(stopCamlock)
+pcall(destroyHighlight)
+pcall(function()RunService:UnbindFromRenderStep(CAM_BIND)end)
+pcall(function()Fluent:Destroy()end)
+if Env.AutoBlockUnload==unload then
+Env.AutoBlockUnload=nil
+end
+end
+Env.AutoBlockUnload=unload
+local secSet=Tabs.Settings:AddSection("Interface","solar/settings-bold")
+secSet:AddButton({
+Title="Unload Script",
+Description="Release F, destroy UI and stop everything",
+Icon="solar/restart-bold",
+Callback=unload,
+})
+local function loadAddon(name,urls)
+if type(Fluent[name])=="table"then return Fluent[name]end
+for _,url in ipairs(urls)do
+local ok,result=pcall(function()return loadstring(game:HttpGet(url))()end)
+if ok and type(result)=="table"and result.SetLibrary then return result end
+end
+return nil
+end
+local SaveManager=loadAddon("SaveManager",{
+"https://github.com/StyearX/Fluent-Modded/releases/download/1.6.0/SaveManager.lua",
+"https://raw.githubusercontent.com/StyearX/Fluent-modded/main/Addons/SaveManager.lua",
+"https://raw.githubusercontent.com/dawid-scripts/Fluent/master/Addons/SaveManager.lua",
+})
+local InterfaceManager=loadAddon("InterfaceManager",{
+"https://github.com/StyearX/Fluent-Modded/releases/download/1.6.0/InterfaceManager.lua",
+"https://raw.githubusercontent.com/StyearX/Fluent-modded/main/Addons/InterfaceManager.lua",
+"https://raw.githubusercontent.com/dawid-scripts/Fluent/master/Addons/InterfaceManager.lua",
+})
+if InterfaceManager then
+InterfaceManager:SetLibrary(Fluent)
+InterfaceManager:SetFolder("AutoBlock")
+pcall(function()InterfaceManager:BuildInterfaceSection(Tabs.Settings)end)
+end
+if SaveManager then
+SaveManager:SetLibrary(Fluent)
+pcall(function()SaveManager:IgnoreThemeSettings()end)
+SaveManager:SetIgnoreIndexes(inputIds)
+SaveManager:SetFolder("AutoBlock/Config")
+pcall(function()SaveManager:BuildConfigSection(Tabs.Config)end)
+end
+Window:SelectTab(1)
+Fluent:Notify({Title="Auto Block",Content="RightControl to toggle UI on/off",Duration=4})
+if SaveManager then
+pcall(function()SaveManager:LoadAutoloadConfig()end)
+end
